@@ -76,11 +76,11 @@ class AggregateWithExpression(BaseSimpleAggregator):
     each data_item selected. The data item will be made available as a
     Pandas Series. Refer to the Pandas series using the local variable named
     "x". The expression must return a scalar value.
-    
+
     Example:
-        
+
     x.max() - x.min()
-    
+
     '''
 
     def __init__(self, input_items, expression, output_items):
@@ -111,7 +111,7 @@ class AlertExpression(BaseEvent):
     Create alerts that are triggered when data values the expression is True
     '''
 
-    def __init__(self, expression, alert_name):
+    def __init__(self, expression, alert_name, **kwargs):
         self.expression = expression
         self.alert_name = alert_name
         super().__init__()
@@ -157,7 +157,7 @@ class AlertOutOfRange(BaseEvent):
     """
 
     def __init__(self, input_item, lower_threshold=None, upper_threshold=None, output_alert_upper='output_alert_upper',
-                 output_alert_lower='output_alert_lower'):
+                 output_alert_lower='output_alert_lower', **kwargs):
 
         self.input_item = input_item
         if not lower_threshold is None:
@@ -212,7 +212,7 @@ class AlertHighValue(BaseEvent):
     Fire alert when metric exceeds an upper threshold'.
     """
 
-    def __init__(self, input_item, upper_threshold=None, alert_name='alert_name', ):
+    def __init__(self, input_item, upper_threshold=None, alert_name='alert_name', **kwargs):
         self.input_item = input_item
         self.upper_threshold = float(upper_threshold)
         self.alert_name = alert_name
@@ -250,7 +250,7 @@ class AlertLowValue(BaseEvent):
     Fire alert when metric goes below a threshold'.
     """
 
-    def __init__(self, input_item, lower_threshold=None, alert_name='alert_name', ):
+    def __init__(self, input_item, lower_threshold=None, alert_name='alert_name', **kwargs):
         self.input_item = input_item
         self.lower_threshold = float(lower_threshold)
         self.alert_name = alert_name
@@ -284,10 +284,10 @@ class AlertLowValue(BaseEvent):
 
 class AutoTest(BaseTransformer):
     '''
-    Test the results of pipeline execution against a known test dataset. 
+    Test the results of pipeline execution against a known test dataset.
     The test will compare calculated values with values in the test dataset.
     Discepancies will the written to a test output file.
-    
+
     Note: This function is experimental
     '''
 
@@ -302,7 +302,7 @@ class AutoTest(BaseTransformer):
         db = self.get_db()
         bucket = self.get_bucket_name()
 
-        file = db.cos_load(filename=self.test_datset_name, bucket=bucket, binary=False)
+        file = db.model_store.retrieve_model(self.test_datset_name)
 
     @classmethod
     def build_ui(cls):
@@ -626,9 +626,9 @@ class EntityDataGenerator(BasePreload):
     Automatically load the entity input data table using new generated data.
     Time series columns defined on the entity data table will be populated
     with random data.
-    
+
     Optional parameters:
-        
+
     freq: pandas frequency string. Time series frequency.
     scd_frequency: pandas frequency string.  Dimension change frequency.
     activity_frequency: pandas frequency string. Activity frequency.
@@ -638,7 +638,7 @@ class EntityDataGenerator(BasePreload):
     data_item_sd: dict keyed by data item name. Standard deviation.
     data_item_domain: dictionary keyed by data item name. List of values.
     drop_existing: bool. Drop existing input tables and generate new for each run.
-        
+
     """
 
     is_data_generator = True
@@ -691,7 +691,7 @@ class EntityDataGenerator(BasePreload):
             self._entity_type.add_slowly_changing_dimension(key, String(255))
             self.data_item_domain[key] = values
 
-        # Add activities metadata to entity type        
+        # Add activities metadata to entity type
         for key, codes in list(self.activities.items()):
             name = '%s_%s' % (self._entity_type.name, key)
             self._entity_type.add_activity_table(name, codes)
@@ -739,6 +739,346 @@ class EntityDataGenerator(BasePreload):
         outputs.append(UIFunctionOutSingle(name='output_item', datatype=bool,
                                            description='Returns a status flag of True when executed'))
 
+        return (inputs, outputs)
+
+
+class AnomalyGeneratorExtremeValue(BaseTransformer):
+    '''
+    This function generates extreme anomaly.
+    '''
+
+    def __init__(self, input_item, factor, size, output_item):
+        self.input_item = input_item
+        self.output_item = output_item
+        self.factor = int(factor)
+        self.size = int(size)
+        super().__init__()
+
+    def execute(self, df):
+
+        logger.debug('Dataframe shape {}'.format(df.shape))
+
+        entity_type = self.get_entity_type()
+        derived_metric_table_name = 'DM_'+ entity_type.logical_name
+        schema = entity_type._db_schema
+
+        #Store and initialize the counts by entity id
+        # db = self.get_db()
+        db = self._entity_type.db
+        query, table = db.query(derived_metric_table_name,schema,column_names='KEY',filters={'KEY':self.output_item})
+        raw_dataframe = db.get_query_data(query)
+        logger.debug('Check for key {} in derived metric table {}'.format(self.output_item,raw_dataframe.shape))
+        key = '_'.join([derived_metric_table_name, self.output_item])
+
+        if raw_dataframe is not None and raw_dataframe.empty:
+            #Delete old counts if present
+            db.model_store.delete_model(key)
+            logger.debug('Intialize count for first run')
+
+        counts_by_entity_id = db.model_store.retrieve_model(key)
+        if counts_by_entity_id is None:
+            counts_by_entity_id = {}
+        logger.debug('Initial Grp Counts {}'.format(counts_by_entity_id))
+
+        #Mark Anomalies
+        timeseries = df.reset_index()
+        timeseries[self.output_item] = timeseries[self.input_item]
+        df_grpby=timeseries.groupby('id')
+        for grp in df_grpby.__iter__():
+
+            entity_grp_id = grp[0]
+            df_entity_grp = grp[1]
+            logger.debug('Group {} Indexes {}'.format(grp[0],df_entity_grp.index))
+
+            count = 0
+            local_std = df_entity_grp.iloc[:10][self.input_item].std()
+            if entity_grp_id in counts_by_entity_id:
+                count = counts_by_entity_id[entity_grp_id]
+
+            mark_anomaly = False
+            for grp_row_index in df_entity_grp.index:
+                count += 1
+                if count%self.factor == 0:
+                    #Mark anomaly point
+                    timeseries[self.output_item].iloc[grp_row_index] = np.random.choice([-1, 1]) * self.size * local_std
+                    logger.debug('Anomaly Index Value{}'.format(grp_row_index))
+
+            counts_by_entity_id[entity_grp_id] = count
+
+        logger.debug('Final Grp Counts {}'.format(counts_by_entity_id))
+
+        #Save the group counts to db
+        db.model_store.store_model(key, counts_by_entity_id)
+
+        timeseries.set_index(df.index.names,inplace=True)
+        return timeseries
+
+    @classmethod
+    def build_ui(cls):
+        inputs = []
+        inputs.append(UISingleItem(
+                name='input_item',
+                datatype=float,
+                description='Item to base anomaly on'
+                                              ))
+
+        inputs.append(UISingle(
+                name='factor',
+                datatype=int,
+                description='Frequency of anomaly e.g. A value of 3 will create anomaly every 3 datapoints',
+                default=5
+                                              ))
+
+        inputs.append(UISingle(
+                name='size',
+                datatype=int,
+                description='Size of extreme anomalies to be created. e.g. 10 will create 10x size extreme anomaly compared to the normal variance',
+                default=10
+                                              ))
+
+        outputs = []
+        outputs.append(UIFunctionOutSingle(
+                name='output_item',
+                datatype=float,
+                description='Generated Item With Extreme anomalies'
+                ))
+        return (inputs, outputs)
+
+
+class AnomalyGeneratorNoData(BaseTransformer):
+    '''
+    This function generates nodata anomaly.
+    '''
+
+    def __init__(self, input_item, width, factor, output_item):
+        self.input_item = input_item
+        self.output_item = output_item
+        self.width = int(width)
+        self.factor = int(factor)
+        super().__init__()
+
+    def execute(self, df):
+
+        logger.debug('Dataframe shape {}'.format(df.shape))
+
+        entity_type = self.get_entity_type()
+        derived_metric_table_name = 'DM_'+entity_type.logical_name
+        schema = entity_type._db_schema
+
+        #Store and initialize the counts by entity id
+        # db = self.get_db()
+        db = self._entity_type.db
+        query, table = db.query(derived_metric_table_name,schema,column_names='KEY',filters={'KEY':self.output_item})
+        raw_dataframe = db.get_query_data(query)
+        logger.debug('Check for key {} in derived metric table {}'.format(self.output_item,raw_dataframe.shape))
+        key = '_'.join([derived_metric_table_name, self.output_item])
+
+        if raw_dataframe is not None and raw_dataframe.empty:
+            #Delete old counts if present
+            db.model_store.delete_model(key)
+            logger.debug('Intialize count for first run')
+
+        counts_by_entity_id = db.model_store.retrieve_model(key)
+        if counts_by_entity_id is None:
+            counts_by_entity_id = {}
+        logger.debug('Initial Grp Counts {}'.format(counts_by_entity_id))
+
+        #Mark Anomalies
+        timeseries = df.reset_index()
+        timeseries[self.output_item] = timeseries[self.input_item]
+        df_grpby=timeseries.groupby('id')
+        for grp in df_grpby.__iter__():
+
+            entity_grp_id = grp[0]
+            df_entity_grp = grp[1]
+            logger.debug('Group {} Indexes {}'.format(grp[0],df_entity_grp.index))
+
+            count = 0
+            width = self.width
+            if entity_grp_id in counts_by_entity_id:
+                count = counts_by_entity_id[entity_grp_id][0]
+                width = counts_by_entity_id[entity_grp_id][1]
+
+            mark_anomaly = False
+            for grp_row_index in df_entity_grp.index:
+                count += 1
+
+                if width!=self.width or count%self.factor == 0:
+                    #Start marking points
+                    mark_anomaly = True
+
+                if mark_anomaly:
+                    timeseries[self.output_item].iloc[grp_row_index] = np.NaN
+                    width -= 1
+                    logger.debug('Anomaly Index Value{}'.format(grp_row_index))
+
+                if width==0:
+                    #End marking points
+                    mark_anomaly = False
+                    #Update values
+                    width = self.width
+                    count = 0
+
+            counts_by_entity_id[entity_grp_id] = (count,width)
+
+        logger.debug('Final Grp Counts {}'.format(counts_by_entity_id))
+
+        #Save the group counts to db
+        db.model_store.store_model(key, counts_by_entity_id)
+
+        timeseries.set_index(df.index.names,inplace=True)
+        return timeseries
+
+    @classmethod
+    def build_ui(cls):
+        inputs = []
+        inputs.append(UISingleItem(
+                name='input_item',
+                datatype=float,
+                description='Item to base anomaly on'
+                                              ))
+
+        inputs.append(UISingle(
+                name='factor',
+                datatype=int,
+                description='Frequency of anomaly e.g. A value of 3 will create anomaly every 3 datapoints',
+                default=10
+                                              ))
+
+        inputs.append(UISingle(
+                name='width',
+                datatype=int,
+                description='Width of the anomaly created',
+                default=5
+                                              ))
+
+        outputs = []
+        outputs.append(UIFunctionOutSingle(
+                name='output_item',
+                datatype=float,
+                description='Generated Item With NoData anomalies'
+                ))
+        return (inputs, outputs)
+
+
+class AnomalyGeneratorFlatline(BaseTransformer):
+    '''
+    This function generates flatline anomaly.
+    '''
+
+    def __init__(self, input_item, width, factor, output_item):
+        self.input_item = input_item
+        self.output_item = output_item
+        self.width = int(width)
+        self.factor = int(factor)
+        super().__init__()
+
+    def execute(self, df):
+
+        logger.debug('Dataframe shape {}'.format(df.shape))
+
+        entity_type = self.get_entity_type()
+        derived_metric_table_name = 'DM_'+entity_type.logical_name
+        schema = entity_type._db_schema
+
+        #Store and initialize the counts by entity id
+        # db = self.get_db()
+        db = self._entity_type.db
+        query, table = db.query(derived_metric_table_name,schema,column_names='KEY',filters={'KEY':self.output_item})
+        raw_dataframe = db.get_query_data(query)
+        logger.debug('Check for key column {} in derived metric table {}'.format(self.output_item,raw_dataframe.shape))
+        key = '_'.join([derived_metric_table_name, self.output_item])
+
+        if raw_dataframe is not None and raw_dataframe.empty:
+            #Delete old counts if present
+            db.model_store.delete_model(key)
+            logger.debug('Intialize count for first run')
+
+        counts_by_entity_id = db.model_store.retrieve_model(key)
+        if counts_by_entity_id is None:
+            counts_by_entity_id = {}
+        logger.debug('Initial Grp Counts {}'.format(counts_by_entity_id))
+
+        #Mark Anomalies
+        timeseries = df.reset_index()
+        timeseries[self.output_item] = timeseries[self.input_item]
+        df_grpby=timeseries.groupby('id')
+        for grp in df_grpby.__iter__():
+
+            entity_grp_id = grp[0]
+            df_entity_grp = grp[1]
+            logger.debug('Group {} Indexes {}'.format(grp[0],df_entity_grp.index))
+
+            count = 0
+            width = self.width
+            local_mean = df_entity_grp.iloc[:10][self.input_item].mean()
+            if entity_grp_id in counts_by_entity_id:
+                count = counts_by_entity_id[entity_grp_id][0]
+                width = counts_by_entity_id[entity_grp_id][1]
+                if count != 0:
+                    local_mean = counts_by_entity_id[entity_grp_id][2]
+
+            mark_anomaly = False
+            for grp_row_index in df_entity_grp.index:
+                count += 1
+
+                if width!=self.width or count%self.factor == 0:
+                    #Start marking points
+                    mark_anomaly = True
+
+                if mark_anomaly:
+                    timeseries[self.output_item].iloc[grp_row_index] = local_mean
+                    width -= 1
+                    logger.debug('Anomaly Index Value{}'.format(grp_row_index))
+
+                if width==0:
+                    #End marking points
+                    mark_anomaly = False
+                    #Update values
+                    width = self.width
+                    count = 0
+                    local_mean = df_entity_grp.iloc[:10][self.input_item].mean()
+
+            counts_by_entity_id[entity_grp_id] = (count,width,local_mean)
+
+
+        logger.debug('Final Grp Counts {}'.format(counts_by_entity_id))
+
+        #Save the group counts to db
+        db.model_store.store_model(key, counts_by_entity_id)
+
+        timeseries.set_index(df.index.names,inplace=True)
+        return timeseries
+
+    @classmethod
+    def build_ui(cls):
+        inputs = []
+        inputs.append(UISingleItem(
+                name='input_item',
+                datatype=float,
+                description='Item to base anomaly on'
+                                              ))
+
+        inputs.append(UISingle(
+                name='factor',
+                datatype=int,
+                description='Frequency of anomaly e.g. A value of 3 will create anomaly every 3 datapoints',
+                default=10
+                                              ))
+
+        inputs.append(UISingle(
+                name='width',
+                datatype=int,
+                description='Width of the anomaly created',
+                default=5
+                                              ))
+
+        outputs = []
+        outputs.append(UIFunctionOutSingle(
+                name='output_item',
+                datatype=float,
+                description='Generated Item With Flatline anomalies'
+                ))
         return (inputs, outputs)
 
 
@@ -815,10 +1155,10 @@ class PythonExpression(BaseTransformer):
 class GetEntityData(BaseDataSource):
     """
     Get time series data from an entity type. Provide the table name for the entity type and
-    specify the key column to use for mapping the source entity type to the destination. 
+    specify the key column to use for mapping the source entity type to the destination.
     e.g. Add temperature sensor data to a location entity type by selecting a location_id
     as the mapping key on the source entity type
-    
+
     Note: This function is experimental
     """
 
@@ -1011,17 +1351,17 @@ class PythonFunction(BaseTransformer):
     code block. The function must be called 'f' and accept two inputs:
     df (a pandas DataFrame) and parameters (a dict that you can use
     to externalize the configuration of the function).
-    
-    The function can return a DataFrame,Series,NumpyArray or scalar value. 
-    
+
+    The function can return a DataFrame,Series,NumpyArray or scalar value.
+
     Example:
     def f(df,parameters):
         #  generate an 2-D array of random numbers
         output = np.random.normal(1,0.1,len(df.index))
         return output
-        
+
     Function source may be pasted in or retrieved from Cloud Object Storage.
-        
+
     PythonFunction is currently experimental.
     """
 
@@ -1050,7 +1390,7 @@ class PythonFunction(BaseTransformer):
 
         if not self.function_code.startswith('def '):
             bucket = self.get_bucket_name()
-            fn = self._entity_type.db.cos_load(filename=self.function_code, bucket=bucket, binary=True)
+            fn = self._entity_type.db.model_store.retrieve_model(self.function_code)
             kw['source'] = 'cos'
             kw['filename'] = self.function_code
             if fn is None:
@@ -1096,7 +1436,7 @@ class PythonFunction(BaseTransformer):
 
 class RaiseError(BaseTransformer):
     """
-    Halt execution of the pipeline raising an error that will be shown. This function is 
+    Halt execution of the pipeline raising an error that will be shown. This function is
     useful for testing a pipeline that is running to completion but not delivering the expected results.
     By halting execution of the pipeline you can view useful diagnostic information in an error
     message displayed in the UI.
@@ -1343,7 +1683,7 @@ class SaveCosDataFrame(BaseTransformer):
 
 class SCDLookup(BaseSCDLookup):
     '''
-    Lookup an slowly changing dimension property from a scd lookup table containing: 
+    Lookup an slowly changing dimension property from a scd lookup table containing:
     Start_date, end_date, device_id and property. End dates are not currently used.
     Previous lookup value is assumed to be valid until the next.
     '''
@@ -1361,7 +1701,7 @@ class ShiftCalendar(BaseTransformer):
                "1": [5.5, 14],
                "2": [14, 21],
                "3": [21, 29.5]
-           },    
+           },
     '''
 
     is_custom_calendar = True
@@ -1383,9 +1723,15 @@ class ShiftCalendar(BaseTransformer):
             raise ValueError('Start date is required when building data for a shift calendar')
         if end_date is None:
             raise ValueError('End date is required when building data for a shift calendar')
-        start_date = start_date.date()
-        end_date = end_date.date()
-        dates= pd.date_range(start=start_date, end=end_date, freq='1D').tolist()
+
+        # Subtract a day from start_date and add a day to end_date to provide shift information for the full
+        # calendar days at left and right boundary.
+        # Example: shift1 = [22:00,10:00], shift2 = [10:00, 22:00], data point = '2019-11-22 23:01:00' ==> data point
+        # falls into shift_day '2019-11-23', not '2019-11-22'
+        one_day = pd.DateOffset(days=1)
+        start_date = start_date.date() - one_day
+        end_date = end_date.date() + one_day
+        dates = pd.date_range(start=start_date, end=end_date, freq='1D').tolist()
         dfs = []
         for shift_id, start_end in list(self.shift_definition.items()):
             data = {}
@@ -1403,6 +1749,12 @@ class ShiftCalendar(BaseTransformer):
     def get_empty_data(self):
         cols = [self.shift_day, self.shift_id, self.period_start_date, self.period_end_date]
         df = pd.DataFrame(columns=cols)
+
+        df[self.period_start_date] = df[self.period_start_date].astype('datetime64[ms]')
+        df[self.period_end_date] = df[self.period_end_date].astype('datetime64[ms]')
+        df[self.shift_day] = df[self.shift_day].astype('datetime64[ms]')
+        df[self.shift_id] = df[self.shift_id].astype('float64')
+
         return df
 
     def execute(self, df):
@@ -1674,9 +2026,9 @@ class IoTCosFunction(BaseTransformer):
     """
     Execute a serialized function retrieved from cloud object storage.
     Function returns a single output.
-    
+
     Function is replaced by PythonFunction
-    
+
     """
 
     is_deprecated = True
@@ -1685,7 +2037,7 @@ class IoTCosFunction(BaseTransformer):
 
         # the function name may be passed as a function object or function name (string)
         # if a string is provided, it is assumed that the function object has already been serialized to COS
-        # if a function onbject is supplied, it will be serialized to cos 
+        # if a function onbject is supplied, it will be serialized to cos
         self.input_items = input_items
         self.output_item = output_item
         super().__init__()

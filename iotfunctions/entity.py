@@ -183,8 +183,8 @@ class Boiler(metadata.BaseCustomEntityType):
                                                    probabilities=[0.9, 0.05, 0.02, 0.02, 0.01], output_item='p_leak'))
 
         # dimension columns
-        dimension_columns = [Column('firmware', String(50)), Column('manufacturer', String(50))
-            ,Column('devicetype', String(50)), Column('evt_timestamp', DateTime)]
+        dimension_columns = [Column('firmware', String(50)), Column('manufacturer', String(50)),
+                             Column('devicetype', String(50)), Column('evt_timestamp', DateTime)]
 
         super().__init__(name=name, db=db, constants=constants, granularities=granularities, columns=columns,
                          functions=functions, dimension_columns=dimension_columns, output_items_extended_metadata={},
@@ -359,14 +359,14 @@ class PackagingHopper(metadata.BaseCustomEntityType):
         functions.append(bif.PythonExpression(expression=('(df["dispensed_mass_predicted"]-'
                                                           ' df["dispensed_mass_actual"]).abs()'),
                                               output_name='prediction_abs_error'))
-        # alert
+        ''' alert
         functions.append(bif.AlertHighValue(input_item='prediction_abs_error', upper_threshold=3,
-                                            alert_name='anomaly_in_fill_detected'))
+                                            alert_name='anomaly_in_fill_detected', Severity='High', Status='New'))'''
         # dimension columns
 
         dimension_columns = [Column('firmware', String(50)), Column('manufacturer', String(50)),
-                             Column('plant', String(50)), Column('line', String(50)),
-                             Column('devicetype', String(50)), Column('evt_timestamp', DateTime)]
+                             Column('plant', String(50)), Column('line', String(50)), Column('devicetype', String(50)),
+                             Column('evt_timestamp', DateTime)]
 
         super().__init__(name=name, db=db, constants=constants, granularities=granularities, columns=columns,
                          functions=functions, dimension_columns=dimension_columns, generate_days=generate_days,
@@ -411,8 +411,8 @@ class SourdoughLeavening(metadata.BaseCustomEntityType):
 
         # dimension columns
         dimension_columns = [Column('firmware', String(50)), Column('manufacturer', String(50)),
-                             Column('plant', String(50)), Column('line', String(50)),
-                             Column('devicetype', String(50)), Column('evt_timestamp', DateTime)]
+                             Column('plant', String(50)), Column('line', String(50)), Column('devicetype', String(50)),
+                             Column('evt_timestamp', DateTime)]
 
         super().__init__(name=name, db=db, constants=constants, granularities=granularities, columns=columns,
                          functions=functions, dimension_columns=dimension_columns, generate_days=generate_days,
@@ -459,7 +459,7 @@ class TestBed(metadata.BaseCustomEntityType):
             bif.AlertExpression(input_items=['x_1', 'x_2'], expression="df['x_1']>3*df['x_2']", alert_name='alert_1'))
         functions.append(bif.AlertOutOfRange(input_item='x_1', lower_threshold=.25, upper_threshold=3,
                                              output_alert_upper='alert_2_upper', output_alert_lower='alert_2_lower'))
-        functions.append(bif.AlertHighValue(input_item='x_1', upper_threshold=3, alert_name='alert_3'))
+        functions.append(bif.AlertHighValue(input_item='x_1', upper_threshold=3, alert_name='alert_3', Severity='Medium', Status='New'))
         functions.append(bif.AlertLowValue(input_item='x_1', lower_threshold=0.25, alert_name='alert_4'))
         functions.append(bif.RandomNull(input_items=['x_1', 'x_2', 'str_1', 'str_2', 'date_1', 'date_2'],
                                         output_items=['x_1_null', 'x_2_null', 'str_1_null', 'str_2_null', 'date_1_null',

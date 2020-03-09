@@ -2038,12 +2038,13 @@ class CalcPipeline:
     A CalcPipeline executes a series of dataframe transformation stages.
     '''
 
-    def __init__(self, stages=None, entity_type=None):
+    def __init__(self, stages=None, entity_type=None, dblogging=None):
         self.logger = logging.getLogger('%s.%s' % (self.__module__, self.__class__.__name__))
         self.entity_type = entity_type
         self.set_stages(stages)
         self.log_pipeline_stages()
-        warnings.warn("CalcPipeline is deprecated. Replaced by JobController.", DeprecationWarning)
+        self.dblogging = dblogging
+        #warnings.warn("CalcPipeline is deprecated. Replaced by JobController.", DeprecationWarning)
 
     def add_expression(self, name, expression):
         '''
@@ -2096,6 +2097,8 @@ class CalcPipeline:
             if not self.entity_type._is_preload_complete:
                 msg = 'Stage %s :' % p.__class__.__name__
                 self.trace_add(msg)
+                if self.dblogging is not None:
+                    self.dblogging.update_stage_info(p.name)
                 status = p.execute(df=None, start_ts=start_ts, end_ts=end_ts, entities=entities)
                 msg = '%s completed as pre-load. ' % p.__class__.__name__
                 self.trace_add(msg)
@@ -2200,18 +2203,22 @@ class CalcPipeline:
         # Behavior is different during initial transform
         if entities is None:
             entities = self.entity_type.get_entity_filter()
+
         start_ts_override = self.entity_type.get_start_ts_override()
         if start_ts_override is not None:
             start_ts = start_ts_override
         end_ts_override = self.entity_type.get_end_ts_override()
         if end_ts_override is not None:
             end_ts = end_ts_override
+
         if is_initial_transform:
             if not start_ts is None:
                 msg = 'Start timestamp: %s.' % start_ts
+                logger.debug(msg)
                 self.trace_add(msg)
             if not end_ts is None:
                 msg = 'End timestamp: %s.' % end_ts
+                logger.debug(msg)
                 self.trace_add(msg)
             # process preload stages first if there are any
             (stages, preload_item_names) = self._execute_preload_stages(start_ts=start_ts, end_ts=end_ts,
@@ -2293,11 +2300,15 @@ class CalcPipeline:
             msg = 'KeyError while conforming index prior to execution of function %s. ' % name
             self.trace_add(msg, created_by=stage, df=df)
             self.entity_type.raise_error(exception=e, abort_on_fail=abort_on_fail, stageName=name)
-        # there are two signatures for the execute method
 
         msg = 'Stage %s :' % name
         self.trace_add(msg=msg, df=df)
+        logger.debug('Start of stage %s' % name)
+        if self.dblogging is not None:
+            self.dblogging.update_stage_info(name)
+        start_time = pd.Timestamp.utcnow()
         try:
+            # there are two signatures for the execute method
             try:
                 newdf = stage.execute(df=df, start_ts=start_ts, end_ts=end_ts, entities=entities)
             except TypeError:
@@ -2323,6 +2334,9 @@ class CalcPipeline:
         except BaseException as e:
             self.trace_add('The function %s failed to execute. ' % name, created_by=stage)
             self.entity_type.raise_error(exception=e, abort_on_fail=abort_on_fail, stageName=name)
+
+        logger.debug('End of stage %s, execution time = %s s' % (name, (pd.Timestamp.utcnow() - start_time).total_seconds()))
+
         # validate that stage has not violated any pipeline processing rules
         try:
             self.validate_df(df, newdf)
@@ -2569,7 +2583,7 @@ class CalcPipeline:
                         logger.info('Type is not consistent %s: df type is %s and data type is %s' % (
                             item, df_column.dtype.name, data_item['columnType']))
                         try:
-                            df[data_item['name']] = pd.to_datetime(df_column)  # try to convert to timestamp
+                            df[data_item['name']] = pd.to_datetime(df_column).astype('datetime64[ms]')  # try to convert to timestamp
                         except Exception:
                             invalid_data_items.append((item, df_column.dtype.name, data_item['columnType']))
                     continue

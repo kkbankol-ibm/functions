@@ -17,7 +17,6 @@ import inspect
 import sys
 import importlib
 import datetime
-
 import pandas as pd
 import subprocess
 from pandas.api.types import is_string_dtype, is_numeric_dtype, is_bool_dtype, is_datetime64_any_dtype, is_dict_like
@@ -33,6 +32,7 @@ from . import metadata as md
 from . import pipeline as pp
 from .enginelog import EngineLogging
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logger = logging.getLogger(__name__)
 
 # Table reflection of SqlAlchemy on DB2 returns DB2-specific type DOUBLE instead of SQL standard type FLOAT
@@ -62,8 +62,9 @@ class Database(object):
     bif_sql = "V1000-18.sql"
 
     def __init__(self, credentials=None, start_session=False, echo=False, tenant_id=None, entity_metadata=None,
-                 entity_type=None):
+                 entity_type=None, model_store=None):
 
+        self.model_store = model_store
         self.function_catalog = {}  # metadata for functions in catalog
         self.write_chunk_size = 1000
         self.credentials = {}
@@ -296,7 +297,7 @@ class Database(object):
 
         logger.info('Connection string for SqlAlchemy => %s): %s' % (self.db_type, connection_string))
 
-        self.http = urllib3.PoolManager()
+        self.http = urllib3.PoolManager(timeout=30.0)
         try:
             self.cos_client = CosClient(self.credentials)
         except KeyError:
@@ -576,7 +577,8 @@ class Database(object):
             logger.debug(msg)
         else:
             until_date = dt.datetime.utcnow() - dt.timedelta(days=older_than_days)
-            result = self.connection.execute(table.delete().where(self.get_column_object( table, timestamp) < until_date))
+            result = self.connection.execute(
+                table.delete().where(self.get_column_object(table, timestamp) < until_date))
             msg = 'deleted data from table %s older than %s' % (table_name, until_date)
             logger.debug(msg)
         self.commit()
@@ -694,11 +696,20 @@ class Database(object):
             if isinstance(table_name, str):
                 kwargs = {'schema': schema}
                 try:
-                    table = Table(table_name.lower(), self.metadata, autoload=True, autoload_with=self.connection,
-                                  **kwargs)
+                    table = Table(table_name, self.metadata, autoload=True, autoload_with=self.connection, **kwargs)
                     table.indexes = set()
                 except NoSuchTableError:
-                    raise KeyError('Table %s does not exist in the schema %s ' % (table_name, schema))
+                    try:
+                        table = Table(table_name.upper(), self.metadata, autoload=True, autoload_with=self.connection,
+                                      **kwargs)
+                        table.indexes = set()
+                    except NoSuchTableError:
+                        try:
+                            table = Table(table_name.lower(), self.metadata, autoload=True,
+                                          autoload_with=self.connection, **kwargs)
+                            table.indexes = set()
+                        except NoSuchTableError:
+                            raise KeyError('Table %s does not exist in the schema %s ' % (table_name, schema))
             elif issubclass(table_name.__class__, BaseTable):
                 table = table_name.table
             elif isinstance(table_name, Table):
@@ -1183,6 +1194,8 @@ class Database(object):
 
         df = self.read_table(table_name=dimension, schema=schema, entities=entities, columns=columns,
                              parse_dates=parse_dates)
+        if parse_dates is not None:
+            df = df.astype(dtype={col: 'datetime64[ms]' for col in parse_dates}, errors='ignore')
 
         return df
 
@@ -1218,6 +1231,9 @@ class Database(object):
                               timestamp_col=timestamp_col, start_ts=start_ts, end_ts=end_ts, entities=entities,
                               dimension=dimension)
         df = pd.read_sql_query(sql=q.statement, con=self.connection, parse_dates=parse_dates)
+        if parse_dates is not None:
+            df = df.astype(dtype={col: 'datetime64[ms]' for col in parse_dates}, errors='ignore')
+
         return (df)
 
     def read_agg(self, table_name, schema, agg_dict, agg_outputs=None, groupby=None, timestamp=None, time_grain=None,
@@ -1708,7 +1724,7 @@ class Database(object):
         '''
 
         a = self.get_table(table_name, schema)
-        #col = a.c[column_name]
+        # col = a.c[column_name]
         col = self.get_column_object(a, column_name)
         exp = func.date_trunc('minute', col)
         '''
@@ -1723,9 +1739,9 @@ class Database(object):
         Returns a column expression that rounds the timestamp to the specified number of minutes
         '''
         a = self.get_table(table_name, schema)
-        #col = a.c[column_name]
+        # col = a.c[column_name]
         col = self.get_column_object(a, column_name)
-        exp = func.date_trunc('hour',col)
+        exp = func.date_trunc('hour', col)
         '''
         date_col = func.timestamp(func.date(col))
         hour_col = (func.hour(col) / hours) * hours
@@ -1813,33 +1829,33 @@ class Database(object):
             if timestamp_col is None:
                 msg = 'No timestamp_col provided to query. Must provide a timestamp column if you have a date filter'
                 raise ValueError(msg)
-            query = query.filter(self.get_column_object( table, timestamp_col) >= start_ts)
+            query = query.filter(self.get_column_object(table, timestamp_col) >= start_ts)
         if not end_ts is None:
             if timestamp_col is None:
                 msg = 'No timestamp_col provided to query. Must provide a timestamp column if you have a date filter'
                 raise ValueError(msg)
-            query = query.filter(self.get_column_object( table, timestamp_col)< end_ts)
+            query = query.filter(self.get_column_object(table, timestamp_col) < end_ts)
         if not entities is None:
             query = query.filter(table.c[deviceid_col].in_(entities))
-            for d, members in list(filters.items()):
+
+        for d, members in list(filters.items()):
+            try:
+                col_obj = self.get_column_object(table, d)
+            except KeyError:
                 try:
-                    col_obj = self.get_column_object(table, d)
+                    col_obj = self.get_column_object(dim, d)
                 except KeyError:
-                    try:
-                        col_obj = self.get_column_object( dim, d)
-                    except KeyError:
-                        raise ValueError('Filter column %s not found in table or dimension' % d)
-                if isinstance(members, str):
-                    members = [members]
-                if not isinstance(members, list):
-                    raise ValueError(
-                        'Invalid filter on %s. Provide a list of members to filter on not %s' % (d, members))
-                elif len(members) == 1:
-                    query = query.filter(col_obj == members[0])
-                elif len(members) == 0:
-                    logger.debug('Ignored query filter on %s with no members', d)
-                else:
-                    query = query.filter(col_obj.in_(members[0]))
+                    raise ValueError('Filter column %s not found in table or dimension' % d)
+            if isinstance(members, str):
+                members = [members]
+            if not isinstance(members, list):
+                raise ValueError('Invalid filter on %s. Provide a list of members to filter on not %s' % (d, members))
+            elif len(members) == 1:
+                query = query.filter(col_obj == members[0])
+            elif len(members) == 0:
+                logger.debug('Ignored query filter on %s with no members', d)
+            else:
+                query = query.filter(col_obj.in_(members[0]))
 
         return (query, table)
 
@@ -1884,7 +1900,6 @@ class Database(object):
                 except KeyError:
                     return False
         return False
-
 
     def query_agg(self, table_name, schema, agg_dict, agg_outputs=None, groupby=None, timestamp=None, time_grain=None,
                   dimension=None, start_ts=None, end_ts=None, entities=None, auto_null_filter=False, filters=None,
@@ -1952,7 +1967,7 @@ class Database(object):
         is_exist_kvp_device_id_col = self.is_column_exists_in_table(table, kvp_device_id_col)
         is_exist_kvp_timestamp_col = self.is_column_exists_in_table(table, kvp_timestamp_col)
 
-        #if kvp_key_col in table_cols and kvp_device_id_col in table_cols and kvp_timestamp_col in table_cols:
+        # if kvp_key_col in table_cols and kvp_device_id_col in table_cols and kvp_timestamp_col in table_cols:
         if is_exist_kvp_key_col and is_exist_kvp_device_id_col and is_exist_kvp_timestamp_col:
             is_kvp = True
             kvp_keys = set(agg_dict.keys())
@@ -2033,7 +2048,7 @@ class Database(object):
             if timestamp is None:
                 msg = 'You must supply a timestamp column when doing a time-based aggregate'
                 raise ValueError(msg)
-            col_object = self.get_column_object( table, timestamp)
+            col_object = self.get_column_object(table, timestamp)
             if time_grain == timestamp:
                 group_by_cols[timestamp] = col_object
             elif time_grain.endswith('min'):
@@ -2049,9 +2064,9 @@ class Database(object):
             elif time_grain == 'week':
                 group_by_cols[timestamp] = func.date_trunc('week', col_object).label(timestamp)
             elif time_grain == 'month':
-                group_by_cols[timestamp] = func.date_trunc('month',col_object).label(timestamp)
+                group_by_cols[timestamp] = func.date_trunc('month', col_object).label(timestamp)
             elif time_grain == 'year':
-                group_by_cols[timestamp] = func.date_trunc('year',col_object).label(timestamp)
+                group_by_cols[timestamp] = func.date_trunc('year', col_object).label(timestamp)
             else:
                 pandas_aggregate = time_grain
 
@@ -2089,12 +2104,12 @@ class Database(object):
                 if timestamp is None:
                     msg = 'No timestamp_col provided to query. Must provide a timestamp column if you have a date filter'
                     raise ValueError(msg)
-                subquery = subquery.filter(self.get_column_object( table, timestamp) >= start_ts)
+                subquery = subquery.filter(self.get_column_object(table, timestamp) >= start_ts)
             if not end_ts is None:
                 if timestamp is None:
                     msg = 'No timestamp_col provided to query. Must provide a timestamp column if you have a date filter'
                     raise ValueError(msg)
-                subquery = subquery.filter(self.get_column_object( table, timestamp) < end_ts)
+                subquery = subquery.filter(self.get_column_object(table, timestamp) < end_ts)
             if not entities is None:
                 subquery = subquery.filter(table.c[deviceid_col].in_(entities))
             for d, members in list(filters.items()):
@@ -2213,7 +2228,7 @@ class Database(object):
         is_exist_kvp_device_id_col = self.is_column_exists_in_table(table, kvp_device_id_col)
         is_exist_kvp_timestamp_col = self.is_column_exists_in_table(table, kvp_timestamp_col)
 
-        #if kvp_key_col in table_cols and kvp_device_id_col in table_cols and kvp_timestamp_col in table_cols:
+        # if kvp_key_col in table_cols and kvp_device_id_col in table_cols and kvp_timestamp_col in table_cols:
         if is_exist_kvp_key_col and is_exist_kvp_device_id_col and is_exist_kvp_timestamp_col:
             is_kvp = True
             kvp_keys = set(agg_dict.keys())
@@ -2295,7 +2310,7 @@ class Database(object):
                 msg = 'You must supply a timestamp column when doing a time-based aggregate'
                 raise ValueError(msg)
             if time_grain == timestamp:
-                group_by_cols[timestamp] = self.get_column_object( table, timestamp)
+                group_by_cols[timestamp] = self.get_column_object(table, timestamp)
             elif time_grain.endswith('min'):
                 minutes = int(time_grain[:-3])
                 group_by_cols[timestamp] = self._ts_col_rounded_to_minutes(table_name, schema, timestamp, minutes,
@@ -2305,13 +2320,16 @@ class Database(object):
                 group_by_cols[timestamp] = self._ts_col_rounded_to_hours(table_name, schema, timestamp, hours,
                                                                          timestamp)
             elif time_grain == 'day':
-                group_by_cols[timestamp] = func.date(self.get_column_object( table, timestamp)).label(timestamp)
+                group_by_cols[timestamp] = func.date(self.get_column_object(table, timestamp)).label(timestamp)
             elif time_grain == 'week':
-                group_by_cols[timestamp] = func.date_trunc('week', self.get_column_object( table, timestamp)).label(timestamp)
+                group_by_cols[timestamp] = func.date_trunc('week', self.get_column_object(table, timestamp)).label(
+                    timestamp)
             elif time_grain == 'month':
-                group_by_cols[timestamp] = func.date_trunc('month', self.get_column_object( table, timestamp)).label(timestamp)
+                group_by_cols[timestamp] = func.date_trunc('month', self.get_column_object(table, timestamp)).label(
+                    timestamp)
             elif time_grain == 'year':
-                group_by_cols[timestamp] = func.date_trunc('year', self.get_column_object( table, timestamp)).label(timestamp)
+                group_by_cols[timestamp] = func.date_trunc('year', self.get_column_object(table, timestamp)).label(
+                    timestamp)
             else:
                 pandas_aggregate = time_grain
 
@@ -2349,12 +2367,12 @@ class Database(object):
                 if timestamp is None:
                     msg = 'No timestamp_col provided to query. Must provide a timestamp column if you have a date filter'
                     raise ValueError(msg)
-                subquery = subquery.filter(self.get_column_object( table, timestamp) >= start_ts)
+                subquery = subquery.filter(self.get_column_object(table, timestamp) >= start_ts)
             if not end_ts is None:
                 if timestamp is None:
                     msg = 'No timestamp_col provided to query. Must provide a timestamp column if you have a date filter'
                     raise ValueError(msg)
-                subquery = subquery.filter(self.get_column_object( table, timestamp) < end_ts)
+                subquery = subquery.filter(self.get_column_object(table, timestamp) < end_ts)
             if not entities is None:
                 subquery = subquery.filter(table.c[deviceid_col].in_(entities))
             for d, members in list(filters.items()):
@@ -2602,6 +2620,7 @@ class Database(object):
                     raise KeyError('Dataframe does not have required columns %s' % cols)
         self.start_session()
         try:
+
             df.to_sql(name=table_name, con=self.connection, schema=schema, if_exists=if_exists, index=False,
                       chunksize=chunksize, dtype=dtypes)
         except:
@@ -2613,7 +2632,6 @@ class Database(object):
             logger.info('Wrote data to table %s ' % table_name)
         return 1
 
-
 class BaseTable(object):
     is_table = True
     _entity_id = 'deviceid'
@@ -2622,7 +2640,7 @@ class BaseTable(object):
     def __init__(self, name, database, *args, **kw):
         as_keywords = ['_timestamp', '_timestamp_col', '_activities', '_freq', '_entity_id', '_df_index_entity_id',
                        '_tenant_id']
-        self.name = name
+        # self.name = name
         self.database = database
         # the keyword arguments may contain properties and sql alchemy dialect specific options
         # set them in child classes before calling super._init__()
@@ -2646,7 +2664,12 @@ class BaseTable(object):
             if kwschema is None:
                 msg = 'Schema passed as None, using default schema'
                 logger.debug(msg)
-        self.table = Table(self.name.lower(), self.database.metadata, *args, **kw)
+
+        if self.database.db_type == 'db2':
+            self.name = name.upper()
+        else:
+            self.name = name.lower()
+        self.table = Table(self.name, self.database.metadata, *args, **kw)
         self.id_col = Column(self._entity_id.lower(), String(50))
         self.table.create(checkfirst=True)
 

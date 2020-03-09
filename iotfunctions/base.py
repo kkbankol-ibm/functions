@@ -162,7 +162,7 @@ class BaseFunction(object):
 
         # if cos credentials are not explicitly  provided use environment variable
         if self.bucket is None:
-            if not self.cos_credentials is None:
+            if self.cos_credentials is not None:
                 try:
                     self.bucket = self.cos_credentials['bucket']
                 except KeyError:
@@ -314,7 +314,7 @@ class BaseFunction(object):
     def execute(self, df):
         """
         AS calls the execute() method of your function to transform or aggregate data. The execute method accepts a dataframe as input and returns a dataframe as output.
-        
+
         If the function should be executed on all entities combined you can replace the execute method wih a custom one
         If the function should be executed by entity instance, use the base execute method. Provide a custom _calc method instead.
         """
@@ -580,7 +580,7 @@ class BaseFunction(object):
         """
         Assemble a dictionary of ICS Analytics Function metadata. Used to submit
         classes the ICS Analytics Function Catalog.
-        
+
         Parameters:
         -----------
         df: DataFrame
@@ -882,6 +882,10 @@ class BaseFunction(object):
         logger.debug(msg)
         df = pd.read_sql_query(query.statement, con=self._entity_type.db.connection,
                                parse_dates=[self._start_date, self._end_date])
+
+        df[self._start_date] = df[self._start_date].astype('datetime64[ms]')
+        df[self._end_date] = df[self._end_date].astype('datetime64[ms]')
+
         return df
 
     def get_test_data(self):
@@ -1190,7 +1194,7 @@ class BaseFunction(object):
         if not credentials is None:
             msg = 'Passing credentials for registration is preserved for compatibility. Use old style credentials when doing so, or omit credentials to use credentials associated with the Database object for the function'
             logger.info(msg)
-            http = urllib3.PoolManager()
+            http = urllib3.PoolManager(timeout=30.0)
             encoded_payload = json.dumps(payload).encode('utf-8')
             if show_metadata or metadata_only:
                 print(encoded_payload)
@@ -1361,7 +1365,7 @@ class BaseFunction(object):
     def write_frame(self, df, table_name=None, version_db_writes=None, if_exists=None):
         '''
         Write a dataframe to a database table
-        
+
         Parameters
         ---------------------
         table_name: str (optional)
@@ -1370,11 +1374,11 @@ class BaseFunction(object):
             Add seprate version_date column to table. If not provided, will use default for instance / class
         if_exists : str (optional)
             What to do if table already exists. If not provided, will use default for instance / class
-        
+
         Returns
         -----------
         numerical status. 1 for successful write.
-            
+
         '''
         df = df.copy()
 
@@ -1463,7 +1467,7 @@ class BaseDataSource(BaseTransformer):
         '''
         Retrieve data and combine with pipeline data
         '''
-        new_df = self.get_data(start_ts=start_ts, end_ts=end_ts, entities=None)
+        new_df = self.get_data(start_ts=start_ts, end_ts=end_ts, entities=entities)
         try:
             new_df = self._entity_type.index_df(new_df)
         except AttributeError:
@@ -1526,13 +1530,14 @@ class BaseDataSource(BaseTransformer):
 
 class BaseEvent(BaseTransformer):
     """
-    Base class for AS Functions that product events or alerts. 
+    Base class for AS Functions that product events or alerts.
 
     """
 
     def __init__(self):
         super().__init__()
         self.tags.append('EVENT')
+        self.tags.append('ALERT')
 
 
 class BaseFilter(BaseTransformer):
@@ -1647,6 +1652,8 @@ class BaseDatabaseLookup(BaseTransformer):
             lup_keys = [x.upper() for x in self.lookup_keys]
             date_cols = [x.upper() for x in self.parse_dates]
             df = pd.read_sql_query(self.sql, con=self.db, index_col=lup_keys, parse_dates=date_cols)
+            df = df.astype(dtype={col: 'datetime64[ms]' for col in date_cols}, errors='ignore')
+
             df.columns = [x.lower() for x in list(df.columns)]
             return (list(df.columns))
 
@@ -1671,6 +1678,9 @@ class BaseDatabaseLookup(BaseTransformer):
         self.trace_append(msg)
         df_sql = pd.read_sql_query(self.sql, self.db.connection, index_col=self.lookup_keys,
                                    parse_dates=self.parse_dates)
+        if self.parse_dates is not None:
+            df_sql = df_sql.astype(dtype={col: 'datetime64[ms]' for col in self.parse_dates}, errors='ignore')
+
         msg = 'Lookup returned columns %s. ' % ','.join(list(df_sql.columns))
         self.trace_append(msg)
 
@@ -1772,26 +1782,36 @@ class BaseDBActivityMerge(BaseDataSource):
                 af = self.read_activity_data(table_name=table_name, activity_code=a, start_ts=start_ts, end_ts=end_ts,
                                              entities=entities)
 
-                af[self._activity] = a
+                unique_af = self.make_start_dates_unique(af)
+
+                unique_af[self._activity] = a
+
                 msg = 'Read activity table %s' % table_name
-                self.log_df_info(af, msg)
-                if len(af.index) > 0:
-                    dfs.append(af)
-                self.available_non_activity_cols.append(self._get_non_activity_cols(af))
-        # execute sql provided explictly
+                self.log_df_info(unique_af, msg)
+                dfs.append(unique_af)
+                self.available_non_activity_cols.append(self._get_non_activity_cols(unique_af))
+
+        # execute sql provided explicitly
         for activity, sql in list(self.activities_custom_query_metadata.items()):
             try:
-                af = pd.read_sql_query(sql, con=self._entity_type.db.connection,
-                                       parse_dates=[self._start_date, self._end_date])
+                parse_dates = [self._start_date, self._end_date]
+                af = pd.read_sql_query(sql, con=self._entity_type.db.connection, parse_dates=parse_dates)
+                af = af.astype(dtype={col: 'datetime64[ms]' for col in parse_dates}, errors='ignore')
             except:
                 logger.warning(
-                    'Function attempted to retrieve data for a merge operation using custom sql. There was a problem with this retrieval operation. Confirm that the sql is valid and contains column aliases for start_date,end_date and device_id')
+                    'Function attempted to retrieve data for a merge operation using custom sql. There was '
+                    'a problem with this retrieval operation. Confirm that the sql is valid and contains '
+                    'column aliases for start_date,end_date and device_id')
                 logger.warning(sql)
                 raise
-            af[self._activity] = activity
-            if len(af.index) > 0:
-                dfs.append(af)
-            self.available_non_activity_cols.append(self._get_non_activity_cols(af))
+
+            unique_af = self.make_start_dates_unique(af)
+
+            unique_af[self._activity] = activity
+
+            dfs.append(unique_af)
+            self.log_df_info(unique_af, msg)
+            self.available_non_activity_cols.append(self._get_non_activity_cols(unique_af))
 
         if len(dfs) == 0:
             cols = []
@@ -1817,8 +1837,11 @@ class BaseDBActivityMerge(BaseDataSource):
                     self.add_dates = []
                     self.custom_calendar_df = custom_calendar.get_empty_data()
             # get scd changes
-            self._entity_scd_dict = self._get_scd_history(start_ts=adf[self._start_date].min(),
-                                                          end_ts=adf[self._end_date].max(), entities=entities)
+            if adf.size > 0:
+                self._entity_scd_dict = self._get_scd_history(start_ts=adf[self._start_date].min(),
+                                                              end_ts=adf[self._end_date].max(), entities=entities)
+            else:
+                self._entity_scd_dict = None
             # merge takes place separately by entity instance
             if self.remove_gaps == 'across_all':
                 group_base = []
@@ -1840,6 +1863,8 @@ class BaseDBActivityMerge(BaseDataSource):
                     else:
                         group_base.append(pd.Grouper(axis=0, level=adf.index.names.index(s)))
                 levels.append(s)
+
+            # Combine activities to remove overlaps of maintenance periods
             try:
                 group = adf.groupby(group_base)
             except KeyError:
@@ -1869,6 +1894,8 @@ class BaseDBActivityMerge(BaseDataSource):
 
             self.log_df_info(cdf, 'After pivot rows to columns')
 
+            # Dataframe cdf contains list of non-overlapping maintenance periods. Merge original lists with
+            # overlapping maintenance periods (dfs) using start_date/deviceid as merge-key
             for i, nadf in enumerate(dfs):
                 add_cols = [x for x in self.available_non_activity_cols[i] if x in self.additional_items]
                 if len(add_cols) > 0:
@@ -1881,15 +1908,58 @@ class BaseDBActivityMerge(BaseDataSource):
                     self.log_df_info(cdf, 'post merge')
                     cdf = self._coallesce_columns(cdf, add_cols)
                     self.log_df_info(cdf, 'post coallesce')
+
             # rename initial outputs
             cdf[self._entity_type._timestamp] = cdf[self._start_date]
-            # add end dates
-            cdf[self._end_date] = cdf[self._start_date].shift(-1)
+
             # index
             cdf = self._entity_type.index_df(cdf)
             cdf = self.rename_cols(cdf, self.additional_items, self.additional_output_names)
 
         return cdf
+
+
+    def make_start_dates_unique(self, af):
+
+        # Add micro second to start date if we have two maintenance periods with an identical start date.
+        # start_date will be used later as key for merge. Therefore the start date must be a unique key
+
+        if af.size > 0:
+            group_base = []
+            for s in self.execute_by:
+                if s in af.columns:
+                    group_base.append(s)
+                else:
+                    try:
+                        af.index.get_level_values(s)
+                    except KeyError:
+                        raise ValueError('This function groups by column %s. This column was not found in columns or '
+                                         'index. Columns: %s Index: %s' % (s, list(af.columns), list(af.index.names)))
+                    else:
+                        group_base.append(pd.Grouper(axis=0, level=af.index.names.index(s)))
+
+            try:
+                group = af.groupby(group_base)
+            except KeyError:
+                msg = 'Attempt to execute unique_start_date by %s. One or more group-by columns were not found' % self.execute_by
+                logger.debug(msg)
+                raise
+
+            try:
+                unique_af = group.apply(self._unique_start_date)
+            except KeyError:
+                msg = 'unique_start_date requires deviceid, start_date, end_date and activity. ' \
+                      'supplied columns are %s' % list(af.columns)
+                logger.debug(msg)
+                raise
+
+            # remove index created by groupby operation
+            unique_af.reset_index(drop=True, inplace=True)
+        else:
+            # return af directly to keep all columns because group.apply() swallows all columns if dataframe is empty!
+            unique_af = af
+
+        return unique_af
 
     def get_item_values(self, arg, db=None):
         '''
@@ -1918,6 +1988,26 @@ class BaseDBActivityMerge(BaseDataSource):
                          'activity']
         cols = [x for x in df.columns if x not in activity_cols]
         return cols
+
+    def _unique_start_date(self, df):
+        micro_second = pd.Timedelta(milliseconds=1)
+
+        df = df.sort_values(by=self._start_date)
+        start_dates_series = df[self._start_date]
+
+        # Add as many microseconds to start_date that it is unique
+        previous_date = start_dates_series.iat[0]
+        for i in range(1, start_dates_series.size):
+            next_date = start_dates_series.iat[i]
+            if next_date > previous_date:
+                previous_date = next_date
+            else:
+                previous_date = previous_date + micro_second
+                start_dates_series.iat[i] = previous_date
+
+        df[self._start_date] = start_dates_series
+
+        return df
 
     def _combine_activities(self, df):
         '''
@@ -1961,17 +2051,17 @@ class BaseDBActivityMerge(BaseDataSource):
         c.index = pd.to_datetime(c.index)
         c.name = self._activity
         c.index.name = self._start_date
-        # use original data to update the new set of intervals in slices
-        for index, row in df.iterrows():
-            end_date = row[self._end_date] - dt.timedelta(microseconds=1)
-            c[row[self._start_date]:end_date] = row[self._activity]
+        # use original data to update the new set of intervals in slices.
+        for df_row in df[[self._start_date, self._end_date, self._activity]].itertuples(index=False, name=None):
+            end_date = df_row[1] - dt.timedelta(milliseconds=1)
+            c[df_row[0]:end_date] = df_row[2]
         df = c.to_frame()
         df.reset_index(inplace=True)
         df.index.name = self.auto_index_name
 
         # add end dates
         df[self._end_date] = df[self._start_date].shift(-1)
-        df[self._end_date] = df[self._end_date] - dt.timedelta(microseconds=1)
+        df[self._end_date] = df[self._end_date] - dt.timedelta(milliseconds=1)
 
         # remove gaps
         if self.remove_gaps:
@@ -1989,20 +2079,27 @@ class BaseDBActivityMerge(BaseDataSource):
 
         cols = [self._start_date, self._end_date, self._activity, 'duration']
         cols.extend(self.execute_by)
-        if self.custom_calendar_df is not None:
-            cols.extend(['shift_id', 'shift_day'])
+
         if self._entity_scd_dict is not None:
             scd_properties = list(self._entity_scd_dict.keys())
             cols.extend(scd_properties)
-        df = pd.DataFrame(columns=cols)
-        df.index.name = self.auto_index_name
 
-        return df
+        new_df = pd.DataFrame(columns=cols)
+        new_df.index.name = self.auto_index_name
+
+        new_df[self._start_date] = new_df[self._start_date].astype('datetime64[ms]')
+        new_df[self._end_date] = new_df[self._end_date].astype('datetime64[ms]')
+        new_df['duration'] = new_df['duration'].astype('float64')
+
+        new_df.set_index(['activity'], drop=False, inplace=True)
+        new_df.set_index(self.execute_by, append=True, inplace=True)
+
+        return new_df
 
     def read_activity_data(self, table_name, activity_code, start_ts=None, end_ts=None, entities=None):
         """
         Issue a query to return a dataframe. Subject is an activity table with columns: deviceid, start_date, end_date, activity
-        
+
         Parameters
         ----------
         table_name: str
@@ -2012,7 +2109,7 @@ class BaseDBActivityMerge(BaseDataSource):
         start_ts : datetime (optional)
             Date filter
         end_ts : datetime (optional)
-            Date filter            
+            Date filter
         entities: list (optional)
             Filter on list of device ids
         Returns
@@ -2030,8 +2127,9 @@ class BaseDBActivityMerge(BaseDataSource):
             query = query.filter(table.c.deviceid.in_(entities))
         msg = 'reading activity %s from %s to %s using %s' % (activity_code, start_ts, end_ts, query.statement)
         logger.debug(msg)
-        df = pd.read_sql_query(query.statement, con=self._entity_type.db.connection,
-                               parse_dates=[self._start_date, self._end_date])
+        parse_dates = [self._start_date, self._end_date]
+        df = pd.read_sql_query(query.statement, con=self._entity_type.db.connection, parse_dates=parse_dates)
+        df = df.astype(dtype={col: 'datetime64[ms]' for col in parse_dates}, errors='ignore')
 
         return df
 
@@ -2054,13 +2152,12 @@ class BaseSCDLookup(BaseTransformer):
         super().__init__()
         self.itemTags['output_item'] = ['DIMENSION']
 
-    def execute(self, df):
+    def execute(self, df, start_ts=None, end_ts=None, entities=None):
 
-        msg = 'Starting scd lookup of %s from table %s. ' % (self.output_item, self.table_name)
+        msg = 'Starting scd lookup of %s from table %s for time interval [%s, %s]. ' % (self.output_item, self.table_name, start_ts, end_ts)
         msg = self.log_df_info(df, msg)
         self.trace_append(msg)
 
-        (start_ts, end_ts, entities) = self._get_data_scope(df)
         resource_df = self.get_scd_data(table_name=self.table_name, start_ts=start_ts, end_ts=end_ts, entities=entities)
         msg = 'df for resource lookup'
         msg = self.log_df_info(resource_df, msg) + '. '
@@ -2118,7 +2215,7 @@ class BasePreload(BaseTransformer):
     Preload functions do not take a dataframe as input
     Preload functions return a single boolean output on execution. Pipeline will proceed when True.
     You guessed it, preload methods have no boundaries. You can use them to do anything!
-    They are monitored. Excessive resource consumption will be billed by estimating an equivalent number of function executions. 
+    They are monitored. Excessive resource consumption will be billed by estimating an equivalent number of function executions.
     """
     is_preload = True
     requires_input_items = False
@@ -2128,7 +2225,7 @@ class BasePreload(BaseTransformer):
     def __init__(self, dummy_items, output_item=None):
         super().__init__()
         self.dummy_items = dummy_items
-        self.output_item = self.name.lower()
+        self.output_item = output_item
         self.optionalItems.extend([self.dummy_items])
         self.itemDatatypes['dummy_items'] = None
         self.itemDatatypes['output_items'] = 'BOOLEAN'
@@ -2177,7 +2274,7 @@ class BaseMetadataProvider(BasePreload):
 
 class BaseEstimatorFunction(BaseTransformer):
     '''
-    Base class for functions that train, evaluate and predict using sklearn 
+    Base class for functions that train, evaluate and predict using sklearn
     compatible estimators.
     '''
     shelf_life_days = None
@@ -2234,11 +2331,23 @@ class BaseEstimatorFunction(BaseTransformer):
         for i, target in enumerate(self.targets):
             results = {}
             trace_message = 'predicting target %s' % target
+            logger.info(trace_message)
             features = self.make_feature_list(features=self.features, df=df, unprocessed_targets=unprocessed_targets)
             model_name = self.get_model_name(target)
+
             # retrieve existing model
-            model = db.cos_load(filename=model_name, bucket=bucket, binary=True)
+            model = None
+            try:
+                model = db.model_store.retrieve_model(model_name)
+                logger.info('load model %s' % str(model))
+            except Exception as e:
+                logger.error('Model retrieval failed with ' + str(e))
+                pass
+
             training_required, results['training_required'] = self.decide_training_required(model)
+
+            logger.info('training required: ' + str(training_required) + '  results: ' + results['training_required'])
+
             if training_required:
                 results['use_existing_model'] = False
                 if model is None:
@@ -2271,12 +2380,12 @@ class BaseEstimatorFunction(BaseTransformer):
         for i, target in enumerate(self.targets):
             model_name = self.get_model_name(target)
             # retrieve existing model
-            model = db.cos_load(filename=model_name, bucket=bucket, binary=True)
+            model = db.model_store.retrieve_model(model_name)
             if model is not None:
                 models.append(model)
-                trace_dict[model_name] = 'Retrieved existing model from COS'
+                trace_dict[model_name] = 'Retrieved existing model from ModelStore'
             else:
-                trace_dict[model_name] = 'Unable to retrieve model from COS'
+                trace_dict[model_name] = 'Unable to retrieve model from ModelStore'
 
         trace = self.get_trace()
         trace.update_last_entry(**trace_dict)
@@ -2306,14 +2415,14 @@ class BaseEstimatorFunction(BaseTransformer):
 
     def delete_models(self, model_names=None):
         '''
-        Delete models stored in COS for this estimator
+        Delete models stored in ModelStore for this estimator
         '''
         if model_names is None:
             model_names = []
             for target in self.targets:
                 model_names.append(self.get_model_name(target))
         for m in model_names:
-            self._entity_type.db.cos_delete(m, bucket=self.get_bucket_name())
+            self._entity_type.db.model_store.delete_model(m)
 
     def execute(self, df):
         df = df.copy()
@@ -2335,9 +2444,18 @@ class BaseEstimatorFunction(BaseTransformer):
                                               features=model.features, existing_model=model, col_name=model.col_name)
             msg = 'Trained model: %s' % best_model
             logger.debug(msg)
-            best_model.test(df_test)
-            self.evaluate_and_write_model(new_model=best_model, current_model=model, db=db, bucket=bucket)
-            msg = 'Finished training model %s' % model.name
+
+            if best_model is not None:
+                if best_model.estimator is None:
+                    best_model = None
+
+            if best_model is None:
+                msg = 'Failed training models'
+            else:
+                best_model.test(df_test)
+                self.evaluate_and_write_model(new_model=best_model, current_model=model, db=db, bucket=bucket)
+                msg = 'Finished training model %s' % model.name
+
             logger.info(msg)  # predictions
         required_models = self.get_models_for_predict(db=db, bucket=bucket)
         for model in required_models:
@@ -2373,6 +2491,7 @@ class BaseEstimatorFunction(BaseTransformer):
         df_train, df_test = train_test_split(df, test_size=self.test_size)
         self.log_df_info(df_train, msg='training set', include_data=False)
         self.log_df_info(df_test, msg='test set', include_data=False)
+        logger.info('Split data - training set ' + str(df_train.shape) + '  test set ' + str(df_test.shape))
         return (df_train, df_test)
 
     def find_best_model(self, df_train, df_test, target, features, existing_model, col_name):
@@ -2408,11 +2527,28 @@ class BaseEstimatorFunction(BaseTransformer):
         for counter, (name, estimator, params) in enumerate(estimators):
             estimator = self.fit_with_search_cv(estimator=estimator, params=params, df_train=df_train, target=target,
                                                 features=features)
+            # in case of a failure to train and cross validate then try next
+            if estimator is None:
+                continue
+
             trace_msg = 'Trained model: %s' % counter
-            results = {'name': self.get_model_name(target_name=target), 'target': target, 'features': features,
+            logger.info(trace_msg)
+
+            try:
+                est_score = estimator.score(df_train[features], df_train[target])
+                logger.info(trace_msg + ' score:' + str(est_score))
+            except Exception as e:
+                logger.info('Estimator predict failed with ' + str(e))
+                trace_msg = 'Trained model prediction failed with ' + str(e)
+                est_score = 0
+                continue
+
+            results = {'name': self.get_model_name(target_name=target),
+                       'target': target, 'features': features,
                        'params': estimator.best_params_, 'eval_metric_name': metric_name,
-                       'eval_metric_train': estimator.score(df_train[features], df_train[target]),
+                       'eval_metric_train': est_score,
                        'estimator_name': name, 'shelf_life_days': self.shelf_life_days, 'col_name': col_name}
+
             model = Model(estimator=estimator, **results)
             results['eval_metric_test'] = model.test(df_test)
             trained_models.append(model)
@@ -2456,10 +2592,10 @@ class BaseEstimatorFunction(BaseTransformer):
         if write_model:
             if self.version_model_writes:
                 version_name = '%s.version.%s' % (current_model.name, current_model.trained_date)
-                db.cos_save(persisted_object=new_model, filename=version_name, bucket=bucket, binary=True)
+                db.model_store.store_model(version_name, new_model)
                 msg = 'wrote current model as version %s' % version_name
                 logger.debug(msg)
-            db.cos_save(persisted_object=new_model, filename=new_model.name, bucket=bucket, binary=True)
+            db.model_store.store_model(new_model.name, new_model)
             msg = ' wrote new model %s ' % new_model.name
             logger.debug(msg)
 
@@ -2478,8 +2614,17 @@ class BaseEstimatorFunction(BaseTransformer):
             df = df_train[cols].dropna()
         else:
             df = df_train
-        estimator = search.fit(X=df[features], y=df[target])
-        msg = 'Used randomize search cross validation to find best hyper parameters for estimator %s' % estimator.__class__.__name__
+
+        # catch exception when we have too few data points for training
+        try:
+            estimator = search.fit(X=df[features], y=df[target])
+            msg = 'Used randomize search cross validation to find best hyper parameters for estimator %s' % estimator.__class__.__name__
+        except ValueError as ve:
+            logger.error('Randomized searched failed with ' + str(ve) + '   Size of training data: ' + str(df.shape))
+            msg = 'Used randomize search cross validation to find best hyper parameters for estimator %s failed !' % estimator.__class__.__name__
+            estimator = None
+            pass
+
         logger.debug(msg)
 
         return estimator
