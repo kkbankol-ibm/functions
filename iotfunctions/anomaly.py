@@ -471,8 +471,8 @@ class KMeansAnomalyScore(BaseTransformer):
                 linear_interpolateK = sp.interpolate.interp1d(
                     time_series_temperature, pred_score, kind='linear', fill_value='extrapolate')
 
-                kmeans_scoreI[kmeans_scoreI < 0] = 0
                 kmeans_scoreI = linear_interpolateK(np.arange(0, temperature.size, 1))
+                kmeans_scoreI[kmeans_scoreI < 0] = 0
 
                 dfe[self.output_item] = kmeans_scoreI
 
