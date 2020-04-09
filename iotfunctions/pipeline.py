@@ -355,7 +355,7 @@ class JobController(object):
                   'data_item_metadata': data_items_dict, 'alerts': alerts}
 
         # If production_mode flag is set to True then only insert data into DB, Publish alerts to message hub and record the usage.
-        if self._production_mode:
+        if ('_production_mode' in self.__dict__.keys()) and (self._production_mode):
             # Add a data writer for non grain or input_level data.
             writer_name = '%s_input_level' % self.name
             data_writer = self.data_writer(name=writer_name, **params)
